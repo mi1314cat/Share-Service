@@ -18,8 +18,10 @@
 # 用法:
 #   bash install.sh               # 安装或升级 (幂等)
 #   bash install.sh --check       # 只检查状态, 不做任何改动
-#   bash install.sh uninstall     # 卸载服务 (数据默认保留)
+#   bash install.sh upgrade       # 只刷新服务代码并重启 (端口/数据/密钥不动)
+#   bash install.sh uninstall --force   # 卸载服务 (数据保留; 有记录时必须显式确认)
 #   bash install.sh uninstall --purge   # 连数据一起删
+#   bash install.sh uninstall           # 没有记录时可直接卸载
 #
 # 环境变量:
 #   PSS_SRC_DIR=<目录>   从本地目录取源码 (不下载); 默认用脚本自身所在目录
@@ -271,19 +273,76 @@ EOF
     return 0
 }
 
+# ---------------------------------------------------------------- 升级
+# 为什么单独要一个动作: do_install 是**幂等**的 —— 已装且健康就什么都不做,
+# 那是"多内核共存"的关键 (SB/X 后装时必须直接复用 M 装好的那份)。
+# 但同一条规则也意味着**代码永远不会被刷新**: 改了 share_service.py 之后
+# 再跑 install.sh 是空操作, 用户会以为升级了其实没有。
+# 所以升级必须显式: 只换代码, 端口/数据/密钥/env 一律不动。
+do_upgrade() {
+    echo "════ 升级 $SERVICE ════"
+    svc_installed || { err "还没安装 —— 先跑: bash install.sh"; return 1; }
+
+    local before="" after="" tmp
+    [[ -f "$INSTALL_DIR/share_service.py" ]] \
+        && before=$(grep -m1 '^VERSION' "$INSTALL_DIR/share_service.py" | cut -d'"' -f2)
+    tmp=$(mktemp -d) || return 1
+    if ! fetch_src "$tmp"; then
+        err "取不到新代码 (本地没有, 远端也拉不到)"
+        rm -rf "$tmp"; return 1
+    fi
+    after=$(grep -m1 '^VERSION' "$tmp/share_service.py" | cut -d'"' -f2)
+
+    if cmp -s "$tmp/share_service.py" "$INSTALL_DIR/share_service.py" 2>/dev/null; then
+        ok "已是最新 (版本 ${before:-?}), 未做任何改动"
+        rm -rf "$tmp"; return 0
+    fi
+    # 原子替换: 先落到 .new 再 mv, 避免"正跑着被写了一半"的文件被下次启动读到
+    install -m 755 "$tmp/share_service.py" "$INSTALL_DIR/share_service.py.new" || {
+        err "写入失败"; rm -rf "$tmp"; return 1; }
+    mv -f "$INSTALL_DIR/share_service.py.new" "$INSTALL_DIR/share_service.py"
+    rm -rf "$tmp"
+    ok "代码已更新: ${before:-?} -> ${after:-?}"
+    dim "端口/数据/管理密钥/env 均未改动"
+
+    systemctl restart "$SERVICE" >/dev/null 2>&1
+    sleep 1
+    if svc_active && [[ -n "$(health_json)" ]]; then
+        ok "服务已重启并通过健康检查 (端口 $(current_port))"
+    else
+        err "重启后健康检查未通过 —— 看 journalctl -u $SERVICE -n 30"
+        return 1
+    fi
+    return 0
+}
+
 # ---------------------------------------------------------------- 卸载
 do_uninstall() {
-    local purge="${1:-}"
+    # --force = 我确认知道已有链接会失效 (仍然保留数据)
+    # --purge = 连数据一起删 (本身就等于确认, 不需要再给 --force)
+    #
+    # 两个开关**解耦**: 以前只有 --purge 能过闸门, 于是"想卸载但想留数据"
+    # 的人被迫连记录一起删掉 —— 那是把"确认危险"和"删数据"绑成了一件事。
+    local force=0 purge=0 a
+    for a in "$@"; do
+        case "$a" in
+            --force) force=1 ;;
+            --purge) purge=1 ;;
+            "") ;;
+            *) err "未知参数: $a"; return 2 ;;
+        esac
+    done
     echo "════ 卸载 $SERVICE ════"
 
     local n=0
     if [[ -d "$DATA_DIR/shares" ]]; then
         n=$(find "$DATA_DIR/shares" -name '*.json' 2>/dev/null | wc -l)
     fi
-    if (( n > 0 )) && [[ "$purge" != "--purge" ]]; then
-        warn "还有 $n 条分享记录在使用中"
-        dim "内核 (M/SB/X) 可能仍在引用它们 —— 卸载服务后这些链接会全部失效。"
-        dim "确定要继续: bash install.sh uninstall --purge"
+    if (( n > 0 )) && (( force == 0 )) && (( purge == 0 )); then
+        warn "还有 $n 条分享记录"
+        dim "M/SB/X 可能仍在引用它们 —— 服务一停, 这些链接立刻全部失效。"
+        dim "确认要卸载 (数据保留): bash install.sh uninstall --force"
+        dim "连数据一起删        : bash install.sh uninstall --purge"
         return 1
     fi
 
@@ -293,7 +352,7 @@ do_uninstall() {
     systemctl daemon-reload 2>/dev/null
     ok "服务已移除"
 
-    if [[ "$purge" == "--purge" ]]; then
+    if (( purge == 1 )); then
         rm -rf "$DATA_DIR" "$ETC" "$INSTALL_DIR"
         ok "数据与配置已删除"
     else
@@ -306,7 +365,8 @@ do_uninstall() {
 need_root
 case "${1:-}" in
     --check)   do_check ;;
-    uninstall) shift; do_uninstall "${1:-}" ;;
+    upgrade)   do_upgrade ;;
+    uninstall) shift; do_uninstall "$@" ;;
     "")        do_install ;;
     *)         err "未知参数: $1"; exit 2 ;;
 esac

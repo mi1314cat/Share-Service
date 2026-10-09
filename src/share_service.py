@@ -247,7 +247,7 @@ def public_view(rec: dict, now: int) -> dict:
     }
 
 
-def cleanup_once(now: int | None = None) -> int:
+def cleanup_once(now: int | None = None, dry: bool = False) -> int:
     """删除**已过期 / 已用尽**的记录, 返回删除条数。
 
     ★ 判据与 effective_state() 完全一致 —— 不另立一套, 否则会出现
@@ -279,6 +279,15 @@ def cleanup_once(now: int | None = None) -> int:
                     dead.append((provider, rec["token"], "used_up"))
     if not dead:
         return 0
+    if dry:
+        # 只报告不删。★ 判据必须与真删**同一段代码** —— 面板另写一套
+        # "我猜清理器会删谁" 的逻辑, 迟早和这里漂移 (实测就出现过: 面板把
+        # 一条已禁用且过期的记录报成"待清理", 而清理器按规则根本不碰它,
+        # 因为主动禁用是用户的记录, 不是垃圾)。
+        for provider, token, why in dead:
+            log("cleanup(dry-run): 会删除 %s 记录 provider=%s token=%s (%s)"
+                % (why, provider, token[:12] + "..", why))
+        return len(dead)
     with share_lock():
         n = 0
         for provider, token, why in dead:
@@ -704,10 +713,12 @@ def main() -> int:
                     help="只做端口探测并打印可用端口, 不启动服务")
     ap.add_argument("--cleanup", action="store_true",
                     help="只清理一次 (过期/用尽的记录) 然后退出")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="配合 --cleanup: 只报告会删哪些, 不真删")
     args = ap.parse_args()
 
     if args.cleanup:
-        n = cleanup_once()
+        n = cleanup_once(dry=args.dry_run)
         print(n)
         return 0
 
