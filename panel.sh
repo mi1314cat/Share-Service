@@ -41,6 +41,13 @@
 #                        [--enable|--disable] [--used-count N]
 #                        [--max-uses N] [--ttl H | --expires-at EPOCH]
 #   bash panel.sh del <token> --provider P
+#
+#   bash panel.sh file <文件路径> [--provider file] [--ttl H] [--max-uses N]
+#                        [--name 显示名] [--content-type T] [--binary]
+#        —— 给一个路径, stdout 直接给分享 URL。文本按 utf-8 存 (浏览器可读),
+#           二进制自动走 base64。默认 provider=file (不属于任何内核)。
+#   bash panel.sh fetch <token> [--out 路径]
+#        —— 把分享内容取回来; 不给 --out 就写 stdout。**走公开端点, 会消耗一次额度**。
 #   bash panel.sh clean [--dry-run]
 #   bash panel.sh check | install | upgrade | start | stop | restart | logs [N]
 #   bash panel.sh uninstall [--force] [--purge]
@@ -123,12 +130,9 @@ svc_installed() { [[ -f "$UNIT" ]]; }
 #   (表现为 list 明明该出数据却报 "服务返回 HTTP ")。文件不受子 shell 影响。
 api_code() { cat "$API_TMP" 2>/dev/null; }
 
-api() { # api <METHOD> <path> [json-body]  -> stdout 只放响应体
-    local m="$1" path="$2" body="${3:-}" tok
-    tok=$(svc_token) || die_down "读不到管理密钥 ($TOKEN_FILE)"
-    local -a args=(-s --max-time 10 -X "$m" -H "Authorization: Bearer $tok")
-    [[ -n "$body" ]] && args+=(-H 'Content-Type: application/json' --data-binary "$body")
-    local out; out=$(curl "${args[@]}" -w $'\n%{http_code}' "http://127.0.0.1:$(svc_port)$path" 2>/dev/null) \
+_api_exec() { # _api_exec <path> <curl 参数...>  -> stdout 只放响应体
+    local path="$1"; shift
+    local out; out=$(curl "$@" -w $'\n%{http_code}' "http://127.0.0.1:$(svc_port)$path" 2>/dev/null) \
         || die_down "连不上服务 (127.0.0.1:$(svc_port)) —— 装了没跑? 端口对不对?"
     local code="${out##*$'\n'}"
     out="${out%$'\n'*}"
@@ -140,6 +144,24 @@ except Exception: print("")' 2>/dev/null)
         [[ -n "$e" ]] && err "服务返回 $code: $e"
     fi
     printf '%s' "$out"
+}
+
+api() { # api <METHOD> <path> [json-body]  —— 小 body 走命令行
+    local m="$1" path="$2" body="${3:-}" tok
+    tok=$(svc_token) || die_down "读不到管理密钥 ($TOKEN_FILE)"
+    local -a args=(-s --max-time 15 -X "$m" -H "Authorization: Bearer $tok")
+    [[ -n "$body" ]] && args+=(-H 'Content-Type: application/json' --data-binary "$body")
+    _api_exec "$path" "${args[@]}"
+}
+
+# 大 body (文件分享的 base64 可以到十几 MB) **必须**走文件。
+# 塞进 argv 会撞 ARG_MAX —— 报错还是 "Argument list too long" 这种
+# 跟业务毫无关系的错, 很难往这儿想。
+api_f() { # api_f <METHOD> <path> <body-file>
+    local m="$1" path="$2" bf="$3" tok
+    tok=$(svc_token) || die_down "读不到管理密钥 ($TOKEN_FILE)"
+    _api_exec "$path" -s --max-time 300 -X "$m" -H "Authorization: Bearer $tok" \
+        -H 'Content-Type: application/json' --data-binary "@$bf"
 }
 
 api_or_die() { # 4xx/5xx 直接按语义退出 (返回码由调用方透传)
@@ -165,6 +187,7 @@ jq_py() { python3 -c "$1" 2>/dev/null; }
 # ---------------------------------------------------------------- 参数解析
 # 极简解析: 子命令 + 具名选项。不做组合短选项 —— 调用方是脚本, 可读性优先。
 PROVIDER=""; FILE=""; TYPE="node"; TAG=""; TTL=""; MAXUSES=""; TOK=""; EXPIRES=""; WANT_JSON=0
+NAME=""; CTYPE=""; OUT=""; BINARY=0
 ENABLED=""; USEDCOUNT=""; N=""; DRYRUN=0; FORCE=0; PURGE=0; POS=()
 
 parse_args() {
@@ -176,6 +199,10 @@ parse_args() {
             --tag)      TAG="${2:-}"; shift 2 ;;
             --ttl)      TTL="${2:-}"; shift 2 ;;
             --expires-at) EXPIRES="${2:-}"; shift 2 ;;
+            --name)     NAME="${2:-}"; shift 2 ;;
+            --content-type) CTYPE="${2:-}"; shift 2 ;;
+            --out)      OUT="${2:-}"; shift 2 ;;
+            --binary)   BINARY=1; shift ;;
             --max-uses) MAXUSES="${2:-}"; shift 2 ;;
             --token)    TOK="${2:-}"; shift 2 ;;
             --used-count) USEDCOUNT="${2:-}"; shift 2 ;;
@@ -456,6 +483,124 @@ cmd_clean() {
      if (( DRYRUN )); then _pss_run --dry-run; else _pss_run; fi)
 }
 
+# ---------------------------------------------------------------- 文件分享
+# 「给一个路径, 换一个链接」。
+#
+# 分工: **面板读路径, 服务存字节**。
+#   不把路径交给服务端去读 —— 它跑在 root 下, 那等于给管理 API 开了一个
+#   "读服务器上任意文件"的口子; 而且文件一移动/备份轮转, 链接就静默失效。
+#   上传一次之后内容就是服务的, 跟原文件没关系了。
+cmd_file() {
+    local path="${POS[0]:-}"
+    [[ -n "$path" ]] || die_usage "用法: panel.sh file <文件路径> [--provider file] [--ttl H] [--max-uses N] [--name 名]"
+    [[ -e "$path" ]] || die_usage "路径不存在: $path"
+    [[ -f "$path" ]] || die_usage "不是普通文件: $path"
+    [[ -r "$path" ]] || die_usage "读不了: $path"
+
+    # 文件分享不属于任何内核, 默认挂在一个独立的 provider 下 ——
+    # 这样它既满足"记录必有 provider"的隔离不变量, 又不会混进内核的列表。
+    [[ -n "$PROVIDER" ]] || PROVIDER="file"
+    _provider_ok "$PROVIDER" || die_usage "provider 非法: $PROVIDER"
+    TYPE="file"
+    health_ok || die_down "服务不可达 (端口 $(svc_port))"
+
+    local size; size=$(stat -c %s "$path" 2>/dev/null || echo 0)
+    (( size > 0 )) || die_usage "文件是空的 (0 字节): $path"
+    # 上限**问服务端要** (health 里的 max_file_bytes), 不各写一个默认值 ——
+    # 两边默认值一旦不同, 面板就会放行一个注定被 413 的文件, 用户白等一场。
+    # 拿不到才退回本地 env。
+    local lim
+    lim=$(curl -s --max-time 5 "http://127.0.0.1:$(svc_port)/api/v1/health" 2>/dev/null \
+          | python3 -c 'import sys,json
+try: print(int(json.load(sys.stdin).get("max_file_bytes", 0)))
+except Exception: print(0)' 2>/dev/null)
+    [[ "${lim:-0}" =~ ^[0-9]+$ ]] && (( lim > 0 )) || lim=$(( ${SHARE_MAX_FILE_MB:-16} * 1024 * 1024 ))
+    if (( size > lim )); then
+        die_usage "文件 ${size} 字节, 超过服务端上限 ${lim} 字节 ($(( lim / 1024 / 1024 )) MiB; 调 SHARE_MAX_FILE_MB 后 upgrade 生效)"
+    fi
+
+    # 文本 / 二进制: 能按 UTF-8 解出来且没有 NUL 就当文本 —— 这样文本文件
+    # 用浏览器打开是可读的, 而不是一串 base64。
+    local enc="utf-8"
+    if (( BINARY )) || ! python3 -c '
+import sys
+try:
+    b = open(sys.argv[1], "rb").read()
+except OSError:
+    sys.exit(1)
+if b"\0" in b: sys.exit(1)
+try: b.decode("utf-8")
+except UnicodeDecodeError: sys.exit(1)
+' "$path" 2>/dev/null; then
+        enc="base64"
+    fi
+
+    local name; name="${NAME:-$(basename "$path")}"
+    local ctype="$CTYPE"
+    if [[ -z "$ctype" ]]; then
+        ctype=$(python3 -c '
+import mimetypes, sys
+t, _ = mimetypes.guess_type(sys.argv[1])
+print(t or "application/octet-stream")
+' "$name" 2>/dev/null)
+    fi
+    # 文本类补上 charset, 否则浏览器可能按 latin-1 猜
+    [[ "$ctype" == text/* && "$ctype" != *charset* ]] && ctype="$ctype; charset=utf-8"
+
+    local bf; bf=$(mktemp /tmp/.pss-body.XXXXXX)
+    if ! python3 - "$path" "$enc" "$PROVIDER" "$TYPE" "$NAME" "$TTL" "$MAXUSES" "$EXPIRES" "$ctype" "$name" "$bf" <<'PY'
+import base64, json, sys
+path, enc, provider, typ, _name, ttl, maxu, exp, ctype, fname, out = sys.argv[1:12]
+with open(path, "rb") as fh:
+    raw = fh.read()
+body = {
+    "provider": provider,
+    "type": typ,
+    "content": base64.b64encode(raw).decode("ascii") if enc == "base64" else raw.decode("utf-8"),
+    "content_encoding": enc,
+    "content_type": ctype,
+    "filename": fname,
+    "meta": {"tag": fname},
+}
+if ttl != "": body["ttl"] = int(ttl) * 3600
+if maxu != "": body["max_uses"] = int(maxu)
+if exp != "": body["expires_at"] = int(exp)
+with open(out, "w", encoding="utf-8") as fh:
+    json.dump(body, fh, ensure_ascii=False)
+PY
+    then
+        rm -f "$bf"; err "组装请求失败"; exit 1
+    fi
+
+    local out rc; out=$(api_f POST /api/v1/shares "$bf"); rc=$?
+    rm -f "$bf"
+    (( rc == 0 )) || exit "$rc"
+    local tk
+    tk=$(printf '%s' "$out" | python3 -c 'import sys,json
+try: print(json.load(sys.stdin).get("token",""))
+except Exception: print("")' 2>/dev/null)
+    [[ -n "$tk" ]] || { err "服务没有返回 token"; exit 1; }
+
+    if (( WANT_JSON )); then printf '%s\n' "$out"; return 0; fi
+    # stdout 只放 URL —— 调用方 `U=$(panel.sh file x.pdf)` 直接就能用
+    local host; host=$(hostname -I 2>/dev/null | awk '{print $1}')
+    printf 'http://%s:%s/share/%s\n' "$host" "$(svc_port)" "$tk"
+}
+
+cmd_fetch() { # 从分享链接取回内容 (走公开端点, **会消耗一次额度**)
+    local tok="${POS[0]:-}"
+    [[ -n "$tok" ]] || die_usage "用法: panel.sh fetch <token> [--out 路径]"
+    local url="http://127.0.0.1:$(svc_port)/share/$tok"
+    if [[ -n "$OUT" ]]; then
+        local code
+        code=$(curl -s -o "$OUT" -w '%{http_code}' --max-time 120 "$url" 2>/dev/null)
+        [[ "$code" == "200" ]] || { rm -f "$OUT"; err "下载失败 HTTP $code"; exit 1; }
+        ok "已保存到 $OUT ($(stat -c %s "$OUT" 2>/dev/null) 字节)"
+    else
+        curl -sS --max-time 120 "$url" 2>/dev/null || { err "下载失败"; exit 1; }
+    fi
+}
+
 # ---- 服务生命周期: 交给 install.sh, 不在这里重复实现一套 ----
 svc_install_sh() {
     local sh="$SELF_DIR/install.sh"
@@ -500,7 +645,8 @@ interactive() {
         printf '%s5)%s 按 provider 统计  %s6)%s 清理到期/用尽\n' "$C_T" "$C_R" "$C_T" "$C_R" >&2
         printf '%s7)%s 重启服务          %s8)%s 查看日志\n' "$C_T" "$C_R" "$C_T" "$C_R" >&2
         printf '%s9)%s 安装/修复服务     %s10)%s 卸载服务\n' "$C_T" "$C_R" "$C_T" "$C_R" >&2
-        printf '%s11)%s 升级服务代码\n' "$C_T" "$C_R" >&2
+        printf '%s11)%s 升级服务代码     %s12)%s 分享一个文件 (给路径换链接)\n' "$C_T" "$C_R" "$C_T" "$C_R" >&2
+        printf '%s13)%s 取回分享内容\n' "$C_T" "$C_R" >&2
         printf '%s0)%s 退出\n' "$C_T" "$C_R" >&2
         local c=""; read -r -p "请选择: " c || return 0
         case "${c// /}" in
@@ -521,6 +667,12 @@ interactive() {
             9) cmd_service install ;;
             10) cmd_service uninstall ;;
             11) cmd_service upgrade ;;
+            12) read -r -p "  文件路径: " fp
+                read -r -p "  有效期小时 (回车=24, 0=永久): " th; TTL="${th:-24}"
+                read -r -p "  可拉取次数 (回车=0 不限): " mu; MAXUSES="${mu:-0}"
+                POS=("$fp"); cmd_file ;;
+            13) read -r -p "  token: " ft; read -r -p "  保存到: " fo
+                POS=("$ft"); OUT="$fo"; cmd_fetch ;;
             0) return 0 ;;
             *) warn "无效选项 $c" ;;
         esac
@@ -543,6 +695,8 @@ case "$cmd" in
     create)    parse_args "$@"; cmd_create ;;
     set)       parse_args "$@"; cmd_set ;;
     del|delete) parse_args "$@"; cmd_del ;;
+    file|share-file) parse_args "$@"; cmd_file ;;
+    fetch|get) parse_args "$@"; cmd_fetch ;;
     clean)     parse_args "$@"; cmd_clean ;;
     logs)      parse_args "$@"; cmd_logs ;;
     check|install|upgrade|start|stop|restart|uninstall)

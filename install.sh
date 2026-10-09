@@ -219,6 +219,10 @@ SHARE_ADMIN_LOOPBACK_ONLY=1
 SHARE_BIND=::
 SHARE_PUBLIC_BASE=
 
+# 文件分享 (type=file) 的单条内容上限。node/config 固定 4 MiB。
+# content 是 JSON 里的一整块, 读一次要整块进内存, 所以别给小内存机器开太大。
+SHARE_MAX_FILE_MB=16
+
 # 自动清理: 用完 / 过期的记录会被删除 (已禁用的保留 —— 那是用户的记录)
 SHARE_AUTO_CLEAN=1
 SHARE_CLEAN_INTERVAL=300

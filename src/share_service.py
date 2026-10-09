@@ -48,6 +48,7 @@ share_service.py — 公共分享服务 (proxy-share-service)
 from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
 import fcntl
 import hashlib
@@ -61,9 +62,10 @@ import socketserver
 import sys
 import threading
 import time
+import urllib.parse
 from http.server import BaseHTTPRequestHandler
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 API_VERSION = 1
 
 # ---- 配置 (全部来自环境变量; 安装器写 /etc/proxy-share-service/env) ----
@@ -101,7 +103,70 @@ TOKEN_RE = re.compile(r"^[0-9a-f]{32}$")
 # provider / type 都只是标签, 但必须限制形状 —— 它们会进**文件路径**
 LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$")
 MAX_CONTENT = 4 * 1024 * 1024          # 4 MiB: 一份完整配置远远够用
-VALID_TYPES = ("node", "config")
+# 文件分享要宽松得多 (截图/PDF/小压缩包)。上限可调, 因为"多大算合理"取决于
+# 机器内存: content 是 JSON 里的一整块, 读一次要整块进内存。
+MAX_FILE_CONTENT = int(os.environ.get("SHARE_MAX_FILE_MB", "16")) * 1024 * 1024
+# 请求体上限: base64 把字节膨胀 4/3, 再留 JSON 包装的余量。
+MAX_BODY = MAX_FILE_CONTENT * 2 + 65536
+
+# node/config 是内核的配置; file 是**通用文件分享** —— 不属于任何内核,
+# 只是借这套 token/TTL/次数 的机制把文件发出去。
+VALID_TYPES = ("node", "config", "file")
+
+
+def _clean_filename(name) -> str:
+    """文件名要进 HTTP 头, 所以这里做净化 —— 只留基名, 去掉引号/换行/控制字符。
+
+    不做的话: 文件名里带 \r\n 就能往响应里注入任意头, 带引号就能破坏
+    Content-Disposition 的语法。文件名来自上传方, 一律不可信。
+    """
+    s2 = str(name or "").replace("\\", "/").split("/")[-1]
+    s2 = "".join(ch for ch in s2 if ch.isprintable() and ch not in '"\r\n')
+    return s2[:200]
+
+
+def content_disposition(rec: dict) -> str:
+    """attachment; filename=... —— ASCII 与中文都要能用。"""
+    fn = _clean_filename(rec.get("filename", ""))
+    if not fn:
+        return ""
+    ascii_fn = fn.encode("ascii", "ignore").decode("ascii").replace('"', "").strip()
+    # 纯中文名会被 ascii 过滤得只剩扩展名 (甚至什么都不剩)。留一个 ".txt"
+    # 这种名字的话, 老客户端存下来的文件连名字都没有 —— 补成 download<ext>。
+    if not ascii_fn or ascii_fn.startswith("."):
+        ext = ""
+        if "." in fn:
+            ext = "." + fn.rsplit(".", 1)[-1].encode("ascii", "ignore").decode("ascii")
+        ascii_fn = "download" + ext
+    quoted = urllib.parse.quote(fn)
+    return 'attachment; filename="%s"; filename*=UTF-8\'\'%s' % (ascii_fn, quoted)
+
+
+def content_raw(rec: dict) -> bytes:
+    """把记录里的 content 还原成**原始字节**。
+
+    为什么要编码字段: content 存在 JSON 里, 只能是字符串。配置本来就是文本,
+    直接存; 而文件可能是二进制 (png/pdf/zip), 塞进 JSON 会被破坏 ——
+    所以二进制走 base64, 由 content_encoding 标明。解码失败一律当空内容,
+    **不能抛** —— 一条坏记录不该让整个服务 500。
+    """
+    c = rec.get("content", "")
+    if not isinstance(c, str):
+        return b""
+    if rec.get("content_encoding") == "base64":
+        try:
+            return base64.b64decode(c, validate=True)
+        except Exception:
+            return b""
+    return c.encode("utf-8")
+
+
+def content_size(rec: dict) -> int:
+    return len(content_raw(rec))
+
+
+def content_hash(rec: dict) -> str:
+    return hashlib.sha256(content_raw(rec)).hexdigest()
 
 
 def log(msg: str) -> None:
@@ -237,11 +302,14 @@ def public_view(rec: dict, now: int) -> dict:
         "enabled": rec.get("enabled", True),
         "state": effective_state(rec, now),
         "content_type": rec.get("content_type", "text/plain; charset=utf-8"),
-        "content_bytes": len(rec.get("content", "").encode("utf-8")),
+        "content_encoding": rec.get("content_encoding", "utf-8"),
+        "filename": rec.get("filename", ""),
+        # content_bytes 报的是**解码后的真实字节数**, 不是 JSON 里那串 base64
+        # 的长度 —— 否则二进制文件的大小会凭空多出 33%, 调用方对不上。
+        "content_bytes": content_size(rec),
         # 内容哈希: 调用方用它判断"要不要 PUT", 避免无谓写盘。
         # 只暴露哈希, 不暴露内容 —— 列表接口不该拖几 MB。
-        "content_sha256": hashlib.sha256(
-            rec.get("content", "").encode("utf-8")).hexdigest(),
+        "content_sha256": content_hash(rec),
         "url_path": "/share/" + str(rec.get("token", "")),
         "url": (PUBLIC_BASE + "/share/" + str(rec.get("token", ""))) if PUBLIC_BASE else "",
     }
@@ -335,7 +403,15 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---------- 基础工具 ----------
     def log_message(self, fmt, *a):
-        log("%s - %s" % (self.address_string(), fmt % a))
+        # ★ 必须截断: fmt%a 里是**客户端可控的任意数据** (请求行)。
+        #   连接一旦错位, 打出来的就是整个请求体 —— 实测一个 20 MiB 的上传
+        #   往 journal 里灌了 27 MB, 而且内容是调用方数据 (可能是密钥)。
+        #   日志要能看, 但不能被调用方灌满。
+        try:
+            msg = fmt % a
+        except Exception:
+            msg = str(fmt)
+        log("%s - %s" % (self.address_string(), " ".join(str(msg).split())[:200]))
 
     def _send(self, code: int, body: bytes = b"",
               ctype: str = "text/plain; charset=utf-8", extra: dict | None = None):
@@ -371,16 +447,34 @@ class Handler(BaseHTTPRequestHandler):
         return hmac.compare_digest(got[7:].strip(), want)
 
     def _read_json(self):
+        """返回 (data, err); err 为 None 表示成功。
+
+        ★ 超限时**必须**把连接标记为关闭。
+
+        踩过的坑: 请求体超过上限时直接回 400 而**没有读走 body**, 连接又是
+        keep-alive, 服务端接着把残留在 socket 里的 body 当成**下一个请求行**
+        去解析 —— 结果是 "Bad request version", 而且默认的 log_message 会把
+        那整段请求行原样写进日志。实测一个 20 MiB 的上传往 journal 里灌了
+        27 MB, 而且那内容是调用方数据 (可能是密钥)。
+        凡是"没读完 body 就应答"的分支, 都要关连接。
+        """
         try:
             n = int(self.headers.get("Content-Length", "0"))
         except ValueError:
-            return None
-        if n <= 0 or n > MAX_CONTENT + 65536:
-            return None
+            self.close_connection = True
+            return None, "bad"
+        if n <= 0:
+            return None, "bad"
+        if n > MAX_BODY:
+            self.close_connection = True
+            return None, "too_large"
         try:
-            return json.loads(self.rfile.read(n).decode("utf-8"))
+            data = json.loads(self.rfile.read(n).decode("utf-8"))
         except (ValueError, UnicodeDecodeError):
-            return None
+            # 读失败时 body 可能只消费了一半, 同样是错位隐患
+            self.close_connection = True
+            return None, "bad"
+        return data, None
 
     def _qs(self):
         if "?" not in self.path:
@@ -399,6 +493,7 @@ class Handler(BaseHTTPRequestHandler):
                 "active": sum(1 for r in recs if effective_state(r, now) == "active"),
                 "node": sum(1 for r in recs if r.get("type") == "node"),
                 "config": sum(1 for r in recs if r.get("type") == "config"),
+                "file": sum(1 for r in recs if r.get("type") == "file"),
             }
         self._json(200, {
             "status": "ok",
@@ -407,6 +502,8 @@ class Handler(BaseHTTPRequestHandler):
             "api_version": API_VERSION,
             "port": PORT,
             "types": list(VALID_TYPES),
+            "max_content_bytes": MAX_CONTENT,
+            "max_file_bytes": MAX_FILE_CONTENT,
             "admin_configured": bool(load_admin_token()),
             "providers": provs,
         })
@@ -440,23 +537,33 @@ class Handler(BaseHTTPRequestHandler):
             if not content:
                 return self._send(503, b"content unavailable\n")
 
+            body = content_raw(rec)
+            ctype = rec.get("content_type", "text/yaml; charset=utf-8")
+            extra = {}
+            cd = content_disposition(rec)
+            if cd:
+                extra["Content-Disposition"] = cd
+
             if self.command == "HEAD":
-                # 只做存在性预检: 不消耗额度
-                return self._send(200, b"", rec.get("content_type", "text/yaml"))
+                # 只做存在性预检: 不消耗额度。
+                # 但 Content-Length 要报**真实大小** —— 传空 body 会发 0,
+                # 客户端就没法在下载前判断值不值得拉。_send 对 HEAD 只写头
+                # 不写体, 所以这里把真 body 传进去是安全的。
+                return self._send(200, body, ctype, extra)
 
             # 提交消费: 在发出响应体之前扣减 —— 拿到 200 必然拿到完整 body
             rec["used_count"] = int(rec.get("used_count", 0)) + 1
             rec["last_used_at"] = int(time.time())
             save_record(rec)
 
-            body = content.encode("utf-8")
-            return self._send(200, body,
-                              rec.get("content_type", "text/yaml; charset=utf-8"))
+            return self._send(200, body, ctype, extra)
 
     # ---------- 管理: 创建 ----------
     def _create(self):
-        data = self._read_json()
-        if not isinstance(data, dict):
+        data, err = self._read_json()
+        if err == "too_large":
+            return self._json(413, {"error": "request body too large", "limit": MAX_BODY})
+        if err or not isinstance(data, dict):
             return self._json(400, {"error": "invalid json"})
 
         provider = str(data.get("provider", "")).strip()
@@ -470,8 +577,21 @@ class Handler(BaseHTTPRequestHandler):
                                     "allowed": list(VALID_TYPES)})
         if not isinstance(content, str) or not content:
             return self._json(400, {"error": "content required"})
-        if len(content.encode("utf-8")) > MAX_CONTENT:
-            return self._json(413, {"error": "content too large"})
+        enc = str(data.get("content_encoding", "utf-8")).strip() or "utf-8"
+        if enc not in ("utf-8", "base64"):
+            return self._json(400, {"error": "invalid content_encoding",
+                                    "allowed": ["utf-8", "base64"]})
+        # 上限按类型分: 配置 4 MiB 足够, 文件给得多一些 (可调)
+        limit = MAX_FILE_CONTENT if rtype == "file" else MAX_CONTENT
+        if len(content.encode("utf-8")) > limit:
+            return self._json(413, {"error": "content too large",
+                                    "limit": limit, "type": rtype})
+        # 标了 base64 就必须真能解码 (见 _update 里同样的理由)
+        if enc == "base64":
+            try:
+                base64.b64decode(content, validate=True)
+            except Exception:
+                return self._json(400, {"error": "content is not valid base64"})
 
         meta = data.get("meta", {})
         if not isinstance(meta, dict):
@@ -522,7 +642,11 @@ class Handler(BaseHTTPRequestHandler):
             "provider": provider,
             "type": rtype,
             "content": content,
+            "content_encoding": enc,
             "content_type": str(data.get("content_type", "text/yaml; charset=utf-8")),
+            # filename 只用于发 Content-Disposition (浏览器点开就是下载)。
+            # 必须清掉换行与引号 —— 它直接进 HTTP 头, 未净化就是一个头注入。
+            "filename": _clean_filename(data.get("filename", "")),
             "meta": meta,
             "created_at": now,
             "expires_at": expires_at,
@@ -568,8 +692,10 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---------- 管理: 更新 ----------
     def _update(self, token: str):
-        data = self._read_json()
-        if not isinstance(data, dict):
+        data, err = self._read_json()
+        if err == "too_large":
+            return self._json(413, {"error": "request body too large", "limit": MAX_BODY})
+        if err or not isinstance(data, dict):
             return self._json(400, {"error": "invalid json"})
         q = self._qs()
         provider = str(data.get("provider", q.get("provider", ""))).strip()
@@ -583,11 +709,29 @@ class Handler(BaseHTTPRequestHandler):
                 c = data["content"]
                 if not isinstance(c, str) or not c:
                     return self._json(400, {"error": "invalid content"})
-                if len(c.encode("utf-8")) > MAX_CONTENT:
-                    return self._json(413, {"error": "content too large"})
+                # 上限按**这条记录自己的类型**算, 不是一律 MAX_CONTENT ——
+                # 否则文件分享能创建却更新不了。
+                _lim = MAX_FILE_CONTENT if rec.get("type") == "file" else MAX_CONTENT
+                if len(c.encode("utf-8")) > _lim:
+                    return self._json(413, {"error": "content too large", "limit": _lim})
+                # 标了 base64 就必须真能解码 —— 否则存进去的是一串坏数据,
+                # 而下载方要等到拉取时才拿到 503/空文件, 排查起来毫无线索。
+                if str(data.get("content_encoding", rec.get("content_encoding", "utf-8"))) == "base64":
+                    try:
+                        base64.b64decode(c, validate=True)
+                    except Exception:
+                        return self._json(400, {"error": "content is not valid base64"})
                 rec["content"] = c
             if "content_type" in data:
                 rec["content_type"] = str(data["content_type"])
+            if "content_encoding" in data:
+                e = str(data["content_encoding"]).strip()
+                if e not in ("utf-8", "base64"):
+                    return self._json(400, {"error": "invalid content_encoding",
+                                            "allowed": ["utf-8", "base64"]})
+                rec["content_encoding"] = e
+            if "filename" in data:
+                rec["filename"] = _clean_filename(data["filename"])
             if "meta" in data and isinstance(data["meta"], dict):
                 rec["meta"] = data["meta"]
             if "enabled" in data:

@@ -35,15 +35,48 @@
 内部**不允许**出现 `if provider == "mihomo"` 这类分支 —— 加第四个内核时，
 `src/share_service.py` 一行都不用改。
 
-## 两类资源
+## 三类资源
 
 ```
 type=node     单节点 / 节点集合的分享
 type=config   整个内核的完整配置分发
+type=file     通用文件分享（不属于任何内核）
 ```
 
-两者在公共服务眼里**行为完全一致**，只是标签不同。区别只在内核侧怎么生成内容、
+三者在公共服务眼里**行为完全一致**，只是标签不同。区别只在内核侧怎么生成内容、
 面板怎么展示。
+
+`type=file` 是"给一个路径，换一个链接"：把服务器上的某个文件（截图、PDF、
+小压缩包、要发给别人的配置……）通过这套 token/TTL/次数 机制发出去，
+不用另外架一个临时 HTTP 服务。
+
+## 文件分享
+
+```bash
+# 给路径, stdout 直接是 URL
+URL=$(bash panel.sh file /root/report.pdf --ttl 24 --max-uses 3)
+# 浏览器打开就是下载; 也可以取回来
+bash panel.sh fetch <token> --out /tmp/report.pdf
+```
+
+几个设计决定：
+
+- **面板读路径，服务存字节**。不把路径交给服务端去读 —— 它跑在 root 下，
+  那等于给管理 API 开了一个"读服务器上任意文件"的口子；而且文件一移动、
+  备份一轮转，链接就静默失效。上传一次之后内容就是服务的，跟原文件无关了。
+- **文本按 utf-8 存，二进制自动走 base64**（`content_encoding` 字段标明）。
+  文本文件用浏览器打开是可读的，而不是一串 base64；二进制则保证逐字节不变。
+  判定是"能否按 UTF-8 解码且不含 NUL"，也可以用 `--binary` 强制。
+- **`filename` 会做净化**再进 `Content-Disposition`（去路径、去引号、去换行）。
+  它来自上传方，一律不可信 —— 不净化就是一个 HTTP 头注入。中文名同时给
+  ASCII 回退与 `filename*=UTF-8''…`，两种客户端都能存对名字。
+- **上限按类型分**：`node`/`config` 4 MiB，`file` 默认 16 MiB
+  （`SHARE_MAX_FILE_MB` 可调，改完 `install.sh upgrade` 生效）。
+  `content` 是 JSON 里的一整块，读一次要整块进内存，所以别给小内存机器开太大。
+  上限由 `/api/v1/health` 的 `max_file_bytes` 报出来，面板照着做本地预检 ——
+  两边不各写一个默认值，否则面板会放行一个注定被拒的文件，用户白等一场。
+- **`file` 是默认 provider**：它不属于任何内核，但记录必须有 provider（隔离
+  不变量），所以单开一个。这样文件分享不会混进内核的列表，内核也看不到它。
 
 ## 安装 / 升级 / 卸载
 
@@ -104,6 +137,8 @@ bash panel.sh show <token> --provider P
 bash panel.sh create --provider P --file F [--tag T] [--ttl H | --expires-at EPOCH] [--max-uses N]
 bash panel.sh set <token> --provider P [--file F] [--enable|--disable] [--used-count N]
 bash panel.sh del <token> --provider P
+bash panel.sh file <文件路径> [--provider file] [--ttl H] [--max-uses N] [--name 名] [--binary]
+bash panel.sh fetch <token> [--out 路径]
 bash panel.sh clean [--dry-run]
 bash panel.sh url <token>
 bash panel.sh check | install | upgrade | start | stop | restart | logs [N]
@@ -147,8 +182,11 @@ bash panel.sh uninstall [--force] [--purge]
 
 ```
 GET  /share/<token>      200 内容 / 404 不存在 / 410 失效 / 503 暂不可用
-HEAD /share/<token>      200 预检，不消耗额度
-GET  /api/v1/health      健康 + API 版本 + 各 provider 计数
+HEAD /share/<token>      200 预检，不消耗额度（Content-Length 是**真实大小**，
+                         客户端能在下载前判断值不值得拉）
+GET  /api/v1/health      健康 + API 版本 + 各 provider 计数 + 各类上限
+
+带 `filename` 的记录会回 `Content-Disposition: attachment; …`，浏览器点开即下载。
 ```
 
 管理（`Authorization: Bearer <admin.token>`，且默认只接受回环来源）：
@@ -169,6 +207,8 @@ DELETE /api/v1/shares/<token>?provider=…   删除（必须带 provider）
   "type": "node",
   "content": "proxies:\n  - name: …",
   "content_type": "text/yaml; charset=utf-8",
+  "content_encoding": "utf-8",
+  "filename": "report.pdf",
   "ttl": 86400,
   "max_uses": 10,
   "meta": { "tag": "all" }
@@ -177,6 +217,13 @@ DELETE /api/v1/shares/<token>?provider=…   删除（必须带 provider）
 
 `meta` 是**不透明元数据**，公共服务只存不读。内核用它记自己的东西
 （比如"这条分享对应哪个节点范围"），用于之后的内容刷新。
+
+`content_encoding` 取 `utf-8`（默认）或 `base64`；标了 `base64` 的内容必须
+真能解码 —— 否则存进去是一串坏数据，下载方要等到拉取时才发现，排查毫无线索。
+
+请求体超过上限时回 **413**（不是 400），并**关闭连接**：不读走 body 就应答、
+连接又是 keep-alive 的话，服务端会把残留的 body 当成下一个请求行去解析 ——
+既错位，又会把整段请求体写进日志。
 
 `token` / `expires_at` 也可以由管理侧指定 —— 前者是给**迁移**用的
 （沿用旧 token，已发出去的链接才不会失效），后者是给"已经过期"的记录
