@@ -80,6 +80,23 @@ ADMIN_LOOPBACK_ONLY = os.environ.get("SHARE_ADMIN_LOOPBACK_ONLY", "1") == "1"
 # 端口被占时向后找多少个
 PORT_SCAN_RANGE = int(os.environ.get("SHARE_PORT_SCAN", "200"))
 
+# ---- 自动清理 (用完 / 过期 的记录默认删除) ----
+#
+# 内核的分享链接大多是**一次性**的 (默认 max_uses=1)。如果不清理, 用过的、
+# 过期的记录会一直躺在数据目录和内核面板的列表里 —— 实测见过 4 条全是
+# "已过期/已用尽"的历史记录, 没有任何用处却占着视线。
+#
+# 清理判据 (与"失效"判据完全一致, 不引入第二套语义):
+#   expires_at > 0 且 now > expires_at       -> 过期
+#   max_uses  > 0 且 used_count >= max_uses  -> 用尽
+#   enabled == false 的**不删** —— 那是用户主动禁用的, 是记录不是垃圾
+#
+# SHARE_CLEAN_GRACE: 失效后保留多久再删 (默认 0 = 立即)。
+#   留个可调的口子是为了"想回看这条被谁用过"的场景, 默认按需求走立即删除。
+AUTO_CLEAN = os.environ.get("SHARE_AUTO_CLEAN", "1") == "1"
+CLEAN_INTERVAL = int(os.environ.get("SHARE_CLEAN_INTERVAL", "300"))
+CLEAN_GRACE = int(os.environ.get("SHARE_CLEAN_GRACE", "0"))
+
 TOKEN_RE = re.compile(r"^[0-9a-f]{32}$")
 # provider / type 都只是标签, 但必须限制形状 —— 它们会进**文件路径**
 LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$")
@@ -228,6 +245,76 @@ def public_view(rec: dict, now: int) -> dict:
         "url_path": "/share/" + str(rec.get("token", "")),
         "url": (PUBLIC_BASE + "/share/" + str(rec.get("token", ""))) if PUBLIC_BASE else "",
     }
+
+
+def cleanup_once(now: int | None = None) -> int:
+    """删除**已过期 / 已用尽**的记录, 返回删除条数。
+
+    ★ 判据与 effective_state() 完全一致 —— 不另立一套, 否则会出现
+      "面板显示已过期、但清理器认为还没到"这种两处漂移。
+
+    进程内/跨进程都走 share_lock: 清理与"扣次数"必须互斥, 否则可能把一条
+    正在被消费的记录删掉 (客户端拿到 200 之后记录没了, 用户看不到使用痕迹)。
+    """
+    now = now or int(time.time())
+    dead = []
+    for provider in iter_providers():
+        for rec in list_records(provider):
+            # 主动禁用的不删 —— 那是用户的记录, 不是垃圾
+            if not rec.get("enabled", True):
+                continue
+            exp = int(rec.get("expires_at", 0))
+            mu = int(rec.get("max_uses", 0))
+            used = int(rec.get("used_count", 0))
+            # 用 >= 而不是 >: 宽限期为 0 时, "刚刚用尽"必须当场可删。
+            # 用 > 的话同一秒内判定不成立, 一条用完的记录要等到下一个清理周期
+            # 才消失 —— 实测就是这样漏掉了一条 (4 条里只删了 1 条)。
+            if exp and now >= exp + CLEAN_GRACE:
+                dead.append((provider, rec["token"], "expired"))
+            elif mu and used >= mu:
+                # 用尽的以**最后一次使用时间**为基准算宽限期, 不是创建时间 ——
+                # 一条 30 天前创建、刚刚才被拉走的分享不该立刻消失。
+                base = int(rec.get("last_used_at", 0)) or int(rec.get("created_at", 0))
+                if now >= base + CLEAN_GRACE:
+                    dead.append((provider, rec["token"], "used_up"))
+    if not dead:
+        return 0
+    with share_lock():
+        n = 0
+        for provider, token, why in dead:
+            if delete_record(provider, token):
+                n += 1
+                log("cleanup: 删除 %s 记录 provider=%s token=%s (%s)"
+                    % (why, provider, token[:12] + "..", why))
+        return n
+
+
+def start_cleaner() -> None:
+    """后台定时清理。AUTO_CLEAN=0 时完全不启动。"""
+    if not AUTO_CLEAN:
+        log("自动清理已关闭 (SHARE_AUTO_CLEAN=0)")
+        return
+
+    def loop():
+        while True:
+            time.sleep(max(30, CLEAN_INTERVAL))
+            try:
+                cleanup_once()
+            except Exception as e:  # noqa: BLE001
+                log("cleanup 异常: %s" % e)
+
+    # 启动时先清一次: 上次停机期间失效的记录不该等到下个周期
+    try:
+        n = cleanup_once()
+        if n:
+            log("启动清理: 删除 %d 条已失效记录" % n)
+    except Exception as e:  # noqa: BLE001
+        log("启动清理异常: %s" % e)
+
+    t = threading.Thread(target=loop, name="cleaner", daemon=True)
+    t.start()
+    log("自动清理已启用: 每 %ds 一次, 宽限期 %ds (用完/过期的记录会被删除)"
+        % (CLEAN_INTERVAL, CLEAN_GRACE))
 
 
 # =============================================================
@@ -615,7 +702,14 @@ def main() -> int:
     ap.add_argument("--data-dir", default=DATA_DIR)
     ap.add_argument("--print-port", action="store_true",
                     help="只做端口探测并打印可用端口, 不启动服务")
+    ap.add_argument("--cleanup", action="store_true",
+                    help="只清理一次 (过期/用尽的记录) 然后退出")
     args = ap.parse_args()
+
+    if args.cleanup:
+        n = cleanup_once()
+        print(n)
+        return 0
 
     if args.print_port:
         srv, _ = try_bind(args.port)
@@ -654,6 +748,7 @@ def main() -> int:
         return 1
 
     write_port_file(PORT)
+    start_cleaner()
     log("已启动 端口 %d (%s)  数据目录 %s" %
         (PORT, "双栈 IPv4+IPv6" if fam == socket.AF_INET6 else "仅 IPv4", DATA_DIR))
     if not load_admin_token():
