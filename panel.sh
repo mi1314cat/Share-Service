@@ -279,7 +279,7 @@ import sys, json
 d = json.load(sys.stdin)
 print("版本      : %s (api v%s)" % (d.get("version","?"), d.get("api_version","?")))
 ps = d.get("providers", {})
-print("内核分享  : %s" % (", ".join("%s=%d" % (k, v["total"]) for k, v in ps.items()) or "（无）"))
+print("分享统计  : %s" % (", ".join("%s=%d" % (k, v["total"]) for k, v in ps.items()) or "（无）"))
 ' 2>/dev/null
     else
         printf '健康检查  : 未通过\n'
@@ -309,13 +309,14 @@ cmd_providers() {
         printf '%s' "$h" | python3 -c 'import sys,json;print(json.dumps(json.load(sys.stdin).get("providers",{}),ensure_ascii=False))'
         return 0
     fi
-    printf '%-14s %6s %6s %6s %6s\n' "PROVIDER" "总数" "活跃" "node" "config"
+    printf '%-14s %6s %6s %6s %6s %6s\n' "PROVIDER" "总数" "活跃" "node" "config" "file"
     printf '%s' "$h" | python3 -c '
 import sys, json
 ps = json.load(sys.stdin).get("providers", {})
 if not ps: print("  （还没有任何内核登记过分享）")
 for k, v in sorted(ps.items()):
-    print("%-14s %6d %6d %6d %6d" % (k, v["total"], v.get("active", 0), v.get("node", 0), v.get("config", 0)))
+    print("%-14s %6d %6d %6d %6d %6d" % (
+        k, v["total"], v.get("active", 0), v.get("node", 0), v.get("config", 0), v.get("file", 0)))
 '
 }
 
